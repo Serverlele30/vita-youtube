@@ -31,7 +31,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape, quoteattr
 
-VERSION = "0.9"
+VERSION = "1.0"
 API_KEY = os.environ.get("YT_API_KEY", "")
 PUBLIC_BASE = os.environ.get("VITA_YT_PUBLIC_BASE", "https://ytv.serverlele.de").rstrip("/")
 # Wohin media:content zeigt. Standard: dieser Server. Mit Vita-Plugin: http://127.0.0.1:8090
@@ -1095,6 +1095,7 @@ def db():
                 kind TEXT NOT NULL, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS watch_later(account_id INTEGER, video_id TEXT, added INTEGER,
                 PRIMARY KEY(account_id, video_id));
+            CREATE TABLE IF NOT EXISTS wl_playlist(account_id INTEGER PRIMARY KEY, playlist_id TEXT NOT NULL);
         """)
         try:
             os.chmod(DB_PATH, 0o600)
@@ -1447,13 +1448,76 @@ def my_likes(acc):
     return cached(("likes", acc), 60, load)
 
 
+WL_TITLE = "PSVita Später ansehen"
+WL_DESC = "Später-ansehen-Liste der PS-Vita-YouTube-App"
+_wl_lock = threading.Lock()
+
+
+def wl_playlist(acc, create=True):
+    """ID der Playlist 'PSVita Später ansehen' (privat) – sucht sie, legt sie bei Bedarf an
+    und übernimmt einmalig die alte lokale Liste. Ersetzt YouTubes 'WL' (per API gesperrt)."""
+    with _wl_lock:
+        row = dbq("SELECT playlist_id FROM wl_playlist WHERE account_id=?", (acc,), one=True)
+        pls = my_playlists(acc)
+        ids = {p["id"] for p in pls}
+        plid = row[0] if row and row[0] in ids else None
+        if not plid:      # gespeicherte fehlt/geloescht -> nach Titel suchen (auch selbst angelegt)
+            plid = next((p["id"] for p in pls if (p.get("snippet") or {}).get("title") == WL_TITLE), None)
+        if not plid and create:
+            p = api_user(lambda: google_token(acc), "playlists", "POST",
+                         {"snippet": {"title": WL_TITLE, "description": WL_DESC},
+                          "status": {"privacyStatus": "private"}}, part="snippet,status")
+            plid = p["id"]
+            forget(acc, "mypl")
+            print(f"WL: Playlist angelegt {plid} fuer Konto {acc}", flush=True)
+        if plid and (not row or row[0] != plid):
+            dbq("INSERT OR REPLACE INTO wl_playlist VALUES(?,?)", (acc, plid), commit=True)
+        if plid:
+            wl_migrate(acc, plid)
+        return plid
+
+
+def wl_migrate(acc, plid):
+    """Alte lokale Später-ansehen-Einträge in die Playlist übernehmen (älteste zuerst)."""
+    rows = dbq("SELECT video_id FROM watch_later WHERE account_id=? ORDER BY added ASC", (acc,))
+    if not rows:
+        return
+    have = {v["id"] for v in playlist_items(plid, lambda: google_token(acc))}
+    for (vid,) in rows:
+        try:
+            if vid not in have:
+                wl_insert(acc, plid, vid)
+            dbq("DELETE FROM watch_later WHERE account_id=? AND video_id=?", (acc, vid), commit=True)
+        except ApiError as e:
+            print(f"WL: Uebernahme {vid} fehlgeschlagen: {e}", flush=True)
+    print(f"WL: {len(rows)} lokale Eintraege uebernommen -> {plid}", flush=True)
+
+
+def wl_insert(acc, plid, vid):
+    """Neu Hinzugefügtes oben einsortieren (wie früher); klappt das nicht, ans Ende."""
+    body = {"snippet": {"playlistId": plid, "position": 0,
+                        "resourceId": {"kind": "youtube#video", "videoId": vid}}}
+    try:
+        it = api_user(lambda: google_token(acc), "playlistItems", "POST", body, part="snippet")
+    except ApiError as e:
+        if "HTTP 400" not in str(e):
+            raise
+        del body["snippet"]["position"]
+        it = api_user(lambda: google_token(acc), "playlistItems", "POST", body, part="snippet")
+    _pl_item_ids[(plid, vid)] = it.get("id", "")
+    forget(acc, "mypl")
+    return it
+
+
 def my_watch_later(acc):
-    ids = [r[0] for r in dbq("SELECT video_id FROM watch_later WHERE account_id=? ORDER BY added DESC", (acc,))]
+    old = dbq("SELECT 1 FROM watch_later WHERE account_id=? LIMIT 1", (acc,), one=True)
+    plid = wl_playlist(acc, create=bool(old))
+    if not plid:
+        return []
     res = []
-    for n, v in enumerate(videos_by_ids(ids), 1):
+    for v in playlist_items(plid, lambda: google_token(acc)):
         v = dict(v)
         v["_entry_id"] = f"tag:youtube.com,2008:playlist:WL:{v['id']}"
-        v["_pos"] = n
         res.append(v)
     return res
 
@@ -1478,7 +1542,8 @@ def r_my_playlists(h, path, query, body):
     acc = need_account(h)
     uid = my_uid(acc)
     return feed_resp(f"tag:youtube.com,2008:user:{uid}:playlists", "Meine Playlists", path, query,
-                     my_playlists(acc), render=lambda p: playlist_link_entry(p, uid, editable=True),
+                     [p for p in my_playlists(acc) if (p.get("snippet") or {}).get("title") != WL_TITLE],
+                     render=lambda p: playlist_link_entry(p, uid, editable=True),
                      kind="playlistLink")
 
 
@@ -1570,10 +1635,17 @@ def act_unsubscribe(acc, sid):
 
 
 def act_watch_later(acc, vid, add):
+    plid = wl_playlist(acc, create=add)
+    if not plid:
+        return
     if add:
-        dbq("INSERT OR REPLACE INTO watch_later VALUES(?,?,?)", (acc, vid, int(time.time())), commit=True)
+        if vid not in {v["id"] for v in playlist_items(plid, lambda: google_token(acc))}:
+            wl_insert(acc, plid, vid)
     else:
-        dbq("DELETE FROM watch_later WHERE account_id=? AND video_id=?", (acc, vid), commit=True)
+        item = playlist_item_id(acc, plid, vid)
+        if item and item != vid:
+            act_playlist_remove(acc, item)
+        _pl_item_ids.pop((plid, vid), None)
 
 
 def act_playlist_add(acc, plid, vid):
