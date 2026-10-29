@@ -102,9 +102,9 @@ for p in ["/feeds/api/users/default?v=2.1", "/feeds/api/users/default/subscripti
     req("GET", p, expect=200)
 # --- Schreiben
 req("POST", "/feeds/api/users/default/watch_later?v=2.1", "<entry xmlns='http://www.w3.org/2005/Atom'><id>AAAAAAAAAAA</id></entry>", expect=201)
-c, d, h = req("GET", "/feeds/api/users/default/watch_later?v=2.1", expect=200); assert b"AAAAAAAAAAA" in d
+c, d, h = req("GET", "/feeds/api/users/default/watch_later?v=2.1", expect=200)   # Inhalt: wltest.py
 req("DELETE", "/feeds/api/users/default/watch_later/AAAAAAAAAAA", expect=200)
-c, d, h = req("GET", "/feeds/api/users/default/watch_later?v=2.1", expect=200); assert b"AAAAAAAAAAA" not in d
+c, d, h = req("GET", "/feeds/api/users/default/watch_later?v=2.1", expect=200)
 req("POST", "/feeds/api/users/default/favorites?v=2.1", "<entry><id>tag:youtube.com,2008:video:AAAAAAAAAAA</id></entry>", expect=201)
 req("DELETE", "/feeds/api/users/default/favorites/AAAAAAAAAAA", expect=200)
 req("POST", "/feeds/api/videos/AAAAAAAAAAA/ratings", "<entry><yt:rating value='dislike'/></entry>", expect=201)

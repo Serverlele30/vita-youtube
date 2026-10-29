@@ -31,7 +31,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape, quoteattr
 
-VERSION = "1.0"
+VERSION = "1.1"
 API_KEY = os.environ.get("YT_API_KEY", "")
 PUBLIC_BASE = os.environ.get("VITA_YT_PUBLIC_BASE", "https://ytv.serverlele.de").rstrip("/")
 # Wohin media:content zeigt. Standard: dieser Server. Mit Vita-Plugin: http://127.0.0.1:8090
@@ -1095,8 +1095,15 @@ def db():
                 kind TEXT NOT NULL, expires INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS watch_later(account_id INTEGER, video_id TEXT, added INTEGER,
                 PRIMARY KEY(account_id, video_id));
-            CREATE TABLE IF NOT EXISTS wl_playlist(account_id INTEGER PRIMARY KEY, playlist_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS wl_playlist(account_id INTEGER PRIMARY KEY, playlist_id TEXT NOT NULL,
+                created INTEGER DEFAULT 0);
         """)
+        try:
+            _db.execute("ALTER TABLE wl_playlist ADD COLUMN created INTEGER DEFAULT 0")
+            _db.execute("UPDATE wl_playlist SET created=?", (int(time.time()),))   # 1.0 -> 1.1
+            _db.commit()
+        except sqlite3.OperationalError:
+            pass
         try:
             os.chmod(DB_PATH, 0o600)
         except OSError:
@@ -1455,26 +1462,51 @@ _wl_lock = threading.Lock()
 
 def wl_playlist(acc, create=True):
     """ID der Playlist 'PSVita Später ansehen' (privat) – sucht sie, legt sie bei Bedarf an
-    und übernimmt einmalig die alte lokale Liste. Ersetzt YouTubes 'WL' (per API gesperrt)."""
+    und übernimmt einmalig die alte lokale Liste. Ersetzt YouTubes 'WL' (per API gesperrt).
+    Frisch angelegte Playlists tauchen bei YouTube erst nach einer Weile in Listen auf
+    -> gespeicherte ID 10 min lang auch ohne Bestätigung verwenden (keine Doppelten)."""
     with _wl_lock:
-        row = dbq("SELECT playlist_id FROM wl_playlist WHERE account_id=?", (acc,), one=True)
+        row = dbq("SELECT playlist_id, created FROM wl_playlist WHERE account_id=?", (acc,), one=True)
         pls = my_playlists(acc)
         ids = {p["id"] for p in pls}
-        plid = row[0] if row and row[0] in ids else None
-        if not plid:      # gespeicherte fehlt/geloescht -> nach Titel suchen (auch selbst angelegt)
-            plid = next((p["id"] for p in pls if (p.get("snippet") or {}).get("title") == WL_TITLE), None)
+        titled = [p["id"] for p in pls if (p.get("snippet") or {}).get("title") == WL_TITLE]
+        young = bool(row) and time.time() - (row[1] or 0) < 600
+        if row and row[0] in ids:
+            plid = row[0]
+        elif titled:
+            plid = titled[0]
+        elif young:
+            plid = row[0]
+        else:
+            plid = None
         if not plid and create:
             p = api_user(lambda: google_token(acc), "playlists", "POST",
                          {"snippet": {"title": WL_TITLE, "description": WL_DESC},
                           "status": {"privacyStatus": "private"}}, part="snippet,status")
             plid = p["id"]
+            dbq("INSERT OR REPLACE INTO wl_playlist VALUES(?,?,?)", (acc, plid, int(time.time())), commit=True)
             forget(acc, "mypl")
             print(f"WL: Playlist angelegt {plid} fuer Konto {acc}", flush=True)
-        if plid and (not row or row[0] != plid):
-            dbq("INSERT OR REPLACE INTO wl_playlist VALUES(?,?)", (acc, plid), commit=True)
+        elif plid and (not row or row[0] != plid):
+            dbq("INSERT OR REPLACE INTO wl_playlist VALUES(?,?,?)", (acc, plid, 0), commit=True)
+            print(f"WL: Playlist gefunden {plid} fuer Konto {acc}", flush=True)
         if plid:
-            wl_migrate(acc, plid)
+            try:
+                wl_migrate(acc, plid)
+            except ApiError as e:
+                print(f"WL: Uebernahme verschoben: {e}", flush=True)
         return plid
+
+
+def wl_items(acc, plid):
+    """Videos der WL-Playlist; 404 (frisch angelegt / noch leer) -> leere Liste statt Fehler."""
+    try:
+        return playlist_items(plid, lambda: google_token(acc))
+    except ApiError as e:
+        if "HTTP 404" not in str(e):
+            raise
+        print(f"WL: {plid} noch nicht abrufbar (404) -> leer", flush=True)
+        return []
 
 
 def wl_migrate(acc, plid):
@@ -1482,7 +1514,7 @@ def wl_migrate(acc, plid):
     rows = dbq("SELECT video_id FROM watch_later WHERE account_id=? ORDER BY added ASC", (acc,))
     if not rows:
         return
-    have = {v["id"] for v in playlist_items(plid, lambda: google_token(acc))}
+    have = {v["id"] for v in wl_items(acc, plid)}
     for (vid,) in rows:
         try:
             if vid not in have:
@@ -1515,7 +1547,7 @@ def my_watch_later(acc):
     if not plid:
         return []
     res = []
-    for v in playlist_items(plid, lambda: google_token(acc)):
+    for v in wl_items(acc, plid):
         v = dict(v)
         v["_entry_id"] = f"tag:youtube.com,2008:playlist:WL:{v['id']}"
         res.append(v)
@@ -1639,7 +1671,7 @@ def act_watch_later(acc, vid, add):
     if not plid:
         return
     if add:
-        if vid not in {v["id"] for v in playlist_items(plid, lambda: google_token(acc))}:
+        if vid not in {v["id"] for v in wl_items(acc, plid)}:
             wl_insert(acc, plid, vid)
     else:
         item = playlist_item_id(acc, plid, vid)
