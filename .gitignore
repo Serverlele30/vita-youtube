@@ -1,0 +1,17 @@
+# Secrets / Zustand – NIE committen
+*.env
+!*.env.example
+*.db
+*.tgz
+backups/
+dump/
+# Build / Python
+plugin/build/
+*.suprx
+*.velf
+*.elf
+__pycache__/
+*.pyc
+# Logs
+*.log
+vytp_log.txt

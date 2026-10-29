@@ -1,0 +1,8 @@
+# YouTube-Teil der redirects.txt (tls_fixer, liegt unter ux0:app/TLSF00001/)
+# Format wie in deiner bestehenden Datei; Twitch-Zeilen (-> ttv.serverlele.de) bleiben unveraendert.
+gdata.youtube.com          -> ytv.serverlele.de
+accounts.google.com        -> ytv.serverlele.de
+www.google.com             -> ytv.serverlele.de
+suggestqueries.google.com  -> ytv.serverlele.de
+vitayt.dl.playstation.net  -> ytv.serverlele.de
+www.youtube.com            -> ytv.serverlele.de

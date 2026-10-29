@@ -1,0 +1,66 @@
+# TLS_FIXER
+*KERNEL
+ur0:tai/tls_fixer.skprx
+
+*main
+ur0:tai/wa_notify.suprx
+
+# ITLS
+*KERNEL
+ur0:tai/itls.skprx
+
+# YAMT
+*NPXS10015
+ur0:tai/yamt.suprx
+*KERNEL
+ur0:tai/yamt_helper.skprx
+
+# This file is used as an alternative if ux0:tai/config.txt is not found.
+# For users plugins, you must refresh taiHEN from HENkaku Settings for
+# changes to take place.
+# For kernel plugins, you must reboot for changes to take place.
+*KERNEL
+# henkaku.skprx is hard-coded to load and is not listed here
+ur0:tai/0syscall6.skprx
+ur0:tai/nonpdrm.skprx
+ur0:tai/repatch.skprx
+ur0:tai/PSVshell.skprx
+ur0:tai/eq_speaker.skprx
+*main
+# main is a special titleid for SceShell
+ur0:tai/henkaku.suprx
+*NPXS10015
+# this is for modifying the version string
+ur0:tai/henkaku.suprx
+*NPXS10016
+# this is for modifying the version string in settings widget
+ur0:tai/henkaku.suprx
+
+# Optional QoL plugins
+*KERNEL
+# removes brightness and wifi restrictions for games
+ur0:tai/NoPowerLimits.skprx
+# increases max/decreases min brightness, disabled by default
+# ur0:tai/vitabright.skprx
+*main
+# shows battery percentage near the gauge
+ur0:tai/shellbat.suprx
+# screenshots are png instead of jpg
+ur0:tai/pngshot.suprx
+
+*KERNEL
+ur0:tai/usbmc.skprx
+ur0:tai/ioplus.skprx
+
+#Minecraft E
+#*PCSB00560
+#ux0:/PC00560/sec_module/mce.supre
+
+# entfernt (gibt es nicht mehr, lagen auf der SD und wurden beim Booten geladen):
+# ux0:data/NeoVitaDB/vdb_daemon.suprx
+# ux0:data/VitaDB/vdb_daemon.suprx
+# ux0:tai/vitachat_daemon.suprx
+
+# PS-Vita-YouTube-Plugin (laedt nur in der YouTube-App)
+*PCSF00150
+ux0:tai/vytp.suprx
