@@ -78,3 +78,45 @@ DELAY.clear(); A._cache.clear(); A.forget(acc, "mypl")
 ids = [v["id"] for v in A.my_watch_later(acc)]; print("nach Freigabe:", ids); assert "MIG00000001" in ids
 assert A.dbq("SELECT COUNT(*) FROM watch_later", one=True)[0] == 0
 print("ALLE 1.1-TESTS OK")
+# --- 1.2: Loeschen per Batch wie die App (users/<name>/watch_later/batch, favoriteId)
+A.api_user = fake; A._cache.clear(); A.forget(acc, "mypl")
+A.act_watch_later(acc, "DEL00000001", True)
+xml = A.video_entry(next(v for v in A.my_watch_later(acc) if v["id"] == "DEL00000001"))
+assert "<yt:favoriteId>DEL00000001</yt:favoriteId>" in xml, xml[:300]
+class H:  # minimaler Handler mit Login
+    headers = {"Authorization": "Bearer X"}
+A.auth_account = lambda h: acc
+body = ("<feed xmlns='http://www.w3.org/2005/Atom' xmlns:batch='http://schemas.google.com/gdata/batch'>"
+        "<batch:operation type=\"delete\"/><entry><id>tag:youtube.com,2008:playlist::DEL00000001</id>"
+        "<link type='application/atom+xml' rel='edit' href=''/></entry></feed>")
+path = "/feeds/api/users/meeeeeeeeeeeeeeeeeeeeee/watch_later/batch"
+assert A.BATCH_RE.match(path)
+c, t, out, hd = A.r_batch(H(), path, {}, body)
+assert b"code='200'" in out, out
+A._cache.clear()
+ids = [v["id"] for v in A.my_watch_later(acc)]; print("nach Batch-Delete:", ids); assert "DEL00000001" not in ids
+# normale Playlist: favoriteId = Eintrags-ID, Batch an playlists/<id>/batch
+plid = "PLandere00000"; ITEMS[plid] = [("ITEMX1", "PLV00000001")]
+e = A.playlist_items(plid, lambda: "GTOK")[0]; assert e["_fav"] == "ITEMX1"
+body2 = body.replace("::DEL00000001", ":" + plid + ":ITEMX1")
+c, t, out, hd = A.r_batch(H(), f"/feeds/api/playlists/{plid}/batch", {}, body2)
+assert b"code='200'" in out and ITEMS[plid] == [], (out, ITEMS[plid])
+print("ALLE 1.2-TESTS OK")
+# --- 1.3: rel='edit' in allen loeschbaren Listen + Batch-ID aus dem edit-Link
+A._cache.clear(); A.forget(acc, "mypl")
+A.act_watch_later(acc, "EDT00000001", True)
+v = next(v for v in A.my_watch_later(acc) if v["id"] == "EDT00000001")
+xml = A.video_entry(v)
+assert "rel='edit' type='application/atom+xml' href=\"http://ytv.serverlele.de/feeds/api/users/default/watch_later/EDT00000001\"" in xml, xml
+e = A.playlist_items("PLandere00000", lambda: "GTOK")
+body3 = ("<feed xmlns='http://www.w3.org/2005/Atom' xmlns:batch='http://schemas.google.com/gdata/batch'>"
+         "<batch:operation type=\"delete\"/><entry><id>tag:youtube.com,2008:playlist::</id>"
+         "<link type='application/atom+xml' rel='edit' href='http://ytv.serverlele.de/feeds/api/users/default/watch_later/EDT00000001'/></entry></feed>")
+c, t, out, hd = A.r_batch(H(), "/feeds/api/users/meeeeeeeeeeeeeeeeeeeeee/watch_later/batch", {}, body3)
+assert b"code='200'" in out, out
+A._cache.clear()
+assert "EDT00000001" not in [v["id"] for v in A.my_watch_later(acc)]
+fx = A.video_entry({**A.videos_by_ids(["FAV00000001"])[0], "_entry_id": "tag:youtube.com,2008:favorite:FAV00000001",
+                    "_fav": "FAV00000001", "_edit": A.EDIT_BASE + "/feeds/api/users/default/favorites/FAV00000001"})
+import xml.dom.minidom as md; md.parseString("<feed xmlns='http://www.w3.org/2005/Atom' xmlns:yt='y' xmlns:gd='g' xmlns:media='m'>" + fx + "</feed>")
+print("ALLE 1.3-TESTS OK")

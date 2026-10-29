@@ -31,7 +31,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape, quoteattr
 
-VERSION = "1.1"
+VERSION = "1.3"
 API_KEY = os.environ.get("YT_API_KEY", "")
 PUBLIC_BASE = os.environ.get("VITA_YT_PUBLIC_BASE", "https://ytv.serverlele.de").rstrip("/")
 # Wohin media:content zeigt. Standard: dieser Server. Mit Vita-Plugin: http://127.0.0.1:8090
@@ -46,6 +46,8 @@ DEFAULT_REGION = os.environ.get("VITA_YT_REGION", "DE")
 FEED_CACHE_S = 600      # Standardfeeds 10 min cachen (spart API-Kontingent)
 FEED_MAX = 200          # max. Eintraege pro Standardfeed (4 API-Abrufe a 50)
 GDATA = "http://gdata.youtube.com"   # so erwartet die App ihre eigenen Links
+# Bearbeiten-Links (rel='edit'): falls die App sie direkt aufruft, muessen sie bei uns landen
+EDIT_BASE = "http://" + urllib.parse.urlsplit(PUBLIC_BASE).netloc
 UP_CHUNK = 8 * 1024 * 1024   # Upstream in 8-MB-Stuecken holen (googlevideo drosselt sonst)
 
 NS = ("xmlns='http://www.w3.org/2005/Atom' "
@@ -180,9 +182,14 @@ def video_entry(v, root=False):
     #   Favoriten:  <id>tag:youtube.com,2008:favorite:FAVID</id> + <yt:favoriteId>FAVID</yt:favoriteId>
     #   Playlists / Spaeter ansehen: <id>tag:youtube.com,2008:playlist:PLID:ITEMID</id> + <yt:position>
     # Ohne diese Felder verwirft die App die Eintraege ("kein Video vorhanden").
-    # Kein rel='edit' (die App baut die Loesch-IDs selbst aus <id>/favoriteId).
+    # Loeschen: Die App merkt sich beim Laden der Liste das href von <link rel='edit'
+    # type='application/atom+xml'> (Feld +0xc8, Parser 0x812b477c). Nur Eintraege MIT diesem Link
+    # landen im Loesch-Job (0x8129a576); fehlt er -> "Ein Fehler ist aufgetreten", ohne Anfrage.
+    # Geloescht wird dann per Batch an users/<name>/<liste>/batch bzw. playlists/<id>/batch.
     entry_id = v.get("_entry_id") or f"tag:youtube.com,2008:video:{vid}"
     edit = f"<yt:favoriteId>{x(v['_fav'])}</yt:favoriteId>" if v.get("_fav") else ""
+    if v.get("_edit"):
+        edit += f"<link rel='edit' type='application/atom+xml' href={a(v['_edit'])}/>"
     pos = f"<yt:position>{int(v['_pos'])}</yt:position>" if v.get("_pos") is not None else ""
     return (
         f"<entry{ns} gd:etag='W/&quot;{vid}&quot;'>"
@@ -915,7 +922,8 @@ def playlist_items(plid, token_fn=None):
                 continue
             v = dict(v)
             v["_entry_id"] = f"tag:youtube.com,2008:playlist:{plid}:{r['id']}"
-            v["_edit"] = f"{GDATA}/feeds/api/playlists/{plid}/{r['id']}"
+            v["_edit"] = f"{EDIT_BASE}/feeds/api/playlists/{plid}/{r['id']}"
+            v["_fav"] = r["id"]      # Loesch-ID fuer die App (Playlist-Eintrags-ID)
             v["_pos"] = n
             out.append(v)
         return out
@@ -1450,6 +1458,7 @@ def my_likes(acc):
             v = dict(v)
             v["_entry_id"] = f"tag:youtube.com,2008:favorite:{v['id']}"
             v["_fav"] = v["id"]
+            v["_edit"] = f"{EDIT_BASE}/feeds/api/users/default/favorites/{v['id']}"
             res.append(v)
         return res
     return cached(("likes", acc), 60, load)
@@ -1550,6 +1559,8 @@ def my_watch_later(acc):
     for v in wl_items(acc, plid):
         v = dict(v)
         v["_entry_id"] = f"tag:youtube.com,2008:playlist:WL:{v['id']}"
+        v["_fav"] = v["id"]
+        v["_edit"] = f"{EDIT_BASE}/feeds/api/users/default/watch_later/{v['id']}"   # noetig zum Loeschen
         res.append(v)
     return res
 
@@ -1736,6 +1747,7 @@ def r_default_post(h, path, query, body):
         v = dict(video_by_id(vid) or {"id": vid})
         v["_entry_id"] = f"tag:youtube.com,2008:favorite:{vid}"
         v["_fav"] = vid
+        v["_edit"] = f"{EDIT_BASE}/feeds/api/users/default/favorites/{vid}"
         return created(video_entry(v))
     if feed == "watch_later":
         vid = body_video_id(body)
@@ -1745,6 +1757,8 @@ def r_default_post(h, path, query, body):
         v = dict(video_by_id(vid) or {"id": vid})
         v["_entry_id"] = f"tag:youtube.com,2008:playlist:WL:{vid}"
         v["_pos"] = 1
+        v["_fav"] = vid
+        v["_edit"] = f"{EDIT_BASE}/feeds/api/users/default/watch_later/{vid}"
         return created(video_entry(v))
     if feed == "subscriptions":
         chid = body_channel_id(body)
@@ -1797,6 +1811,9 @@ def r_playlist_post(h, path, query, body):
     v = dict(video_by_id(vid) or {"id": vid})
     v["_entry_id"] = f"tag:youtube.com,2008:playlist:{plid}:{it.get('id', '')}"
     v["_pos"] = 1
+    if it.get("id"):
+        v["_fav"] = it["id"]
+        v["_edit"] = f"{EDIT_BASE}/feeds/api/playlists/{plid}/{it['id']}"
     return created(video_entry(v))
 
 
@@ -1819,8 +1836,9 @@ def r_playlist_delete(h, path, query, body):
 
 
 # ---------------------------------------------------------------- Batch
-BATCH_RE = re.compile(r"^/feeds/api/(videos|users/default/(favorites|watch_later|subscriptions|playlists)|"
-                      r"users/[A-Za-z0-9_-]+/favorites|playlists/([A-Za-z0-9_-]{10,64}))/batch$")
+# Die App schickt Loeschungen an users/<Nutzername>/... (nicht nur users/default)
+BATCH_RE = re.compile(r"^/feeds/api/(videos|users/[A-Za-z0-9_-]+/(favorites|watch_later|subscriptions|playlists)|"
+                      r"playlists/([A-Za-z0-9_-]{10,64}))/batch$")
 
 
 def r_batch(h, path, query, body):
@@ -1838,6 +1856,10 @@ def r_batch(h, path, query, body):
         id_m = re.search(r"<id>(.*?)</id>", ent, re.S)
         ident = (id_m.group(1).strip() if id_m else "")
         last = ident.rstrip("/").split("/")[-1].split("?")[0].split(":")[-1]
+        ed_m = re.search(r"<link\b[^>]*rel=['\"]edit['\"][^>]*>", ent)
+        href_m = re.search(r"href=['\"]([^'\"]+)['\"]", ed_m.group(0)) if ed_m else None
+        if href_m:      # Loesch-Batch der App: <link rel='edit' href='.../liste/ID'/>
+            last = href_m.group(1).rstrip("/").split("/")[-1].split("?")[0] or last
         code, reason, payload = 200, "Success", ""
         try:
             if target == "videos":           # query: Videos einzeln nachladen
