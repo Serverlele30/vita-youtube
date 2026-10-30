@@ -23,7 +23,7 @@
 #include <psp2/net/net.h>
 #include <psp2/net/http.h>
 
-#define VYTP_VERSION "3.1"
+#define VYTP_VERSION "3.2"
 #ifndef VERBOSE
 #define VERBOSE 0   /* 1 = jede Anfrage loggen/melden (nur zur Fehlersuche) */
 #endif
@@ -235,7 +235,7 @@ static int http_template(void) {
     sceHttpSetResolveRetry(g_tmpl, 2);
     sceHttpSetConnectTimeOut(g_tmpl, 8 * 1000 * 1000);
     sceHttpSetSendTimeOut(g_tmpl, 10 * 1000 * 1000);
-    sceHttpSetRecvTimeOut(g_tmpl, 15 * 1000 * 1000);
+    sceHttpSetRecvTimeOut(g_tmpl, 20 * 1000 * 1000);
     return g_tmpl;
 }
 
@@ -494,12 +494,35 @@ static char g_slot_url[MAX_CLIENTS][4096];   /* eigene URL-Kopie je Stream (Cach
 static volatile int g_slot_used[MAX_CLIENTS];
 
 /* start..end an die App senden. 0 = fertig, 1 = App hat abgebrochen, -1 = Fehler */
+/* Abriss-Festigkeit: Laeuft die App-Wiedergabe-Puffer voll, liest die App nicht weiter, wir
+ * blockieren im send und googlevideo schliesst die ruhende Verbindung. Dann einfach neu
+ * verbinden und ab der aktuellen Stelle weiterladen - so oft noetig, solange es vorangeht. */
+#define MAX_STALL 6                     /* Versuche ohne jeden Fortschritt bis zum Aufgeben */
+
 static int stream_range(int c, char *buf, char *url, unsigned long long start,
                         unsigned long long end, const char *vid) {
     unsigned long long pos = start;
-    int refreshed = 0, fails = 0, ret = 0;
+    int refreshed = 0, stall = 0, ret = 0, last_err = 0, resumes = 0;
     hreq_t hr = {-1, -1};                     /* eine googlevideo-Verbindung fuer alle Stuecke */
+    static const int wait_ms[MAX_STALL] = {0, 500, 1000, 2000, 3000, 4000};
     while (pos <= end) {
+        if (stall >= MAX_STALL) {
+            char m[120], p1[24];
+            sceClibSnprintf(m, sizeof m, "stream-aufgegeben %s kb=%s err=0x%08X", vid,
+                            u64s(pos / 1024, p1), last_err);
+            log_line(m);
+            ping(m);
+            ret = -1;
+            break;
+        }
+        if (stall && wait_ms[stall]) sceKernelDelayThread(wait_ms[stall] * 1000);
+        if (stall == 3 && !refreshed) {      /* hartnaeckig -> URL erneuern */
+            sceKernelLockMutex(g_lock, 1, NULL);
+            vcache_t *e = resolve(vid, 1);
+            if (e) sceClibStrncpy(url, e->url, 4096);
+            sceKernelUnlockMutex(g_lock, 1);
+            refreshed = 1;
+        }
         unsigned long long b = pos + UP_CHUNK - 1;
         if (b > end) b = end;
         char range[64], s1[24], s2[24];
@@ -507,12 +530,7 @@ static int stream_range(int c, char *buf, char *url, unsigned long long start,
         const char *hdrs[] = {"Range", range, 0};
         int status = 0;
         int r = http_open(&hr, 1, SCE_HTTP_METHOD_GET, url, hdrs, 0, 0, &status);
-        if (r < 0) {
-            if (++fails <= 2) { sceKernelDelayThread(1000 * 1000); continue; }
-            event("gv-https-fehler 0x%s%08X", "", r);
-            ret = -1;
-            break;
-        }
+        if (r < 0) { last_err = r; stall++; continue; }
         if ((status == 403 || status == 410) && !refreshed) {   /* URL abgelaufen -> neu holen */
             http_close(&hr, 0);
             sceKernelLockMutex(g_lock, 1, NULL);
@@ -525,12 +543,14 @@ static int stream_range(int c, char *buf, char *url, unsigned long long start,
         }
         if (status != 206 && status != 200) {
             http_close(&hr, 0);
-            if (status >= 500 && ++fails <= 2) { sceKernelDelayThread(1000 * 1000); continue; }
+            last_err = status;
+            if (status >= 500 || status == 429) { stall++; continue; }
             event("gv-http %s%d", "", status);
             ret = -1;
             break;
         }
         if (pos == start) info("gv-ok %s%d", "", status);
+        unsigned long long before = pos;
         int n = 0;
         while (pos <= b) {
             n = sceHttpReadData(hr.req, buf, IO_BUF);
@@ -540,15 +560,21 @@ static int stream_range(int c, char *buf, char *url, unsigned long long start,
         }
         if (ret == 1) { http_close(&hr, 0); break; }
         int complete = (pos > b) && drain(hr.req);
-        http_close(&hr, complete);
-        if (pos <= b) {                       /* Stueck unvollstaendig -> ab pos weitermachen */
-            if (++fails <= 3) { info("gv-luecke %s%d", "", n); continue; }
-            ret = -1;
-            break;
+        http_close(&hr, complete);           /* unvollstaendig -> Verbindung verwerfen, neu */
+        if (pos <= b) {                       /* abgerissen -> ab pos weiter */
+            last_err = n;
+            if (pos > before) { stall = 0; resumes++; }   /* es ging voran -> kein Fehlversuch */
+            else stall++;
+            continue;
         }
-        fails = 0;
+        stall = 0;
     }
     http_close(&hr, 0);
+    if (resumes) {
+        char m[96];
+        sceClibSnprintf(m, sizeof m, "stream-fortgesetzt %s x%d", vid, resumes);
+        log_line(m);                          /* nur ins Log (zur Kontrolle), kein Ping */
+    }
     return ret;
 }
 
