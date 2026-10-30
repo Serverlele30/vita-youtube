@@ -19,8 +19,13 @@ Stand 0.8:
   - Unbekannte /feeds/api/*: leerer Feed statt Fehler (wird geloggt)
 """
 import base64
+import gzip
 import hashlib
+import http.client
 import json
+import ssl
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import re
 import threading
@@ -31,7 +36,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from xml.sax.saxutils import escape, quoteattr
 
-VERSION = "1.3"
+VERSION = "1.4"
 API_KEY = os.environ.get("YT_API_KEY", "")
 PUBLIC_BASE = os.environ.get("VITA_YT_PUBLIC_BASE", "https://ytv.serverlele.de").rstrip("/")
 # Wohin media:content zeigt. Standard: dieser Server. Mit Vita-Plugin: http://127.0.0.1:8090
@@ -118,16 +123,137 @@ def iso_dur(s):
     return ((d * 24 + h) * 60 + mi) * 60 + se
 
 
+_inflight = {}          # key -> threading.Event (laeuft gerade)
+_forgot = {}            # key -> Zeitpunkt von forget() (verhindert, dass alte Ladung zurueckschreibt)
+_bg = ThreadPoolExecutor(max_workers=4, thread_name_prefix="refresh")
+STALE_FACTOR = 12       # abgelaufene Daten bis 12x TTL sofort liefern, im Hintergrund erneuern
+CACHE_MAX = 6000
+
+
+def _store(key, t0, val):
+    with _cache_lock:
+        if _forgot.get(key, 0) > t0:
+            return
+        _cache[key] = (t0, val)
+        if len(_cache) > CACHE_MAX:              # aelteste 20 % wegwerfen
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[:CACHE_MAX // 5]:
+                _cache.pop(k, None)
+
+
+def _load(key, fn):
+    """fn() genau einmal je Schluessel gleichzeitig ausfuehren; andere warten auf das Ergebnis."""
+    with _cache_lock:
+        ev = _inflight.get(key)
+        mine = ev is None
+        if mine:
+            ev = _inflight[key] = threading.Event()
+    if not mine:
+        ev.wait(30)
+        with _cache_lock:
+            hit = _cache.get(key)
+        if hit:
+            return hit[1]
+    t0 = time.time()
+    try:
+        val = fn()
+        _store(key, t0, val)
+        return val
+    finally:
+        if mine:
+            with _cache_lock:
+                _inflight.pop(key, None)
+            ev.set()
+
+
+def _refresh(key, fn):
+    try:
+        _load(key, fn)
+    except Exception as e:      # noqa: BLE001 - Hintergrund: alte Daten bleiben
+        print(f"CACHE: Erneuern {key[0]} fehlgeschlagen: {e}", flush=True)
+
+
 def cached(key, ttl, fn):
+    """Frisch -> sofort. Abgelaufen, aber < STALE_FACTOR*ttl -> alte Daten sofort, im
+    Hintergrund neu laden. Sonst laden (gleichzeitige Anfragen teilen sich einen Abruf)."""
     now = time.time()
     with _cache_lock:
         hit = _cache.get(key)
-        if hit and now - hit[0] < ttl:
+        busy = key in _inflight
+    if hit:
+        age = now - hit[0]
+        if age < ttl:
             return hit[1]
-    val = fn()
-    with _cache_lock:
-        _cache[key] = (now, val)
-    return val
+        if age < ttl * STALE_FACTOR:
+            if not busy:
+                _bg.submit(_refresh, key, fn)
+            return hit[1]
+    return _load(key, fn)
+
+
+# ---------------------------------------------------------------- HTTP mit offenen Verbindungen
+_tls = ssl.create_default_context()
+_idle = {}                  # host -> [HTTPSConnection, ...]  offene Verbindungen (alle Threads)
+_idle_lock = threading.Lock()
+IDLE_PER_HOST = 8
+
+
+class FetchError(Exception):
+    pass
+
+
+def _take(host, timeout):
+    with _idle_lock:
+        lst = _idle.get(host)
+        while lst:
+            c, t = lst.pop()
+            if time.time() - t < 50:            # Google schliesst ruhende Verbindungen nach ~60 s+
+                return c, False
+            c.close()
+    return http.client.HTTPSConnection(host, 443, timeout=timeout, context=_tls), True
+
+
+def _give(host, conn):
+    with _idle_lock:
+        lst = _idle.setdefault(host, [])
+        if len(lst) < IDLE_PER_HOST:
+            lst.append((conn, time.time()))
+            return
+    conn.close()
+
+
+def fetch(url, data=None, headers=None, method=None, timeout=12):
+    """HTTPS-Abruf ueber offen gehaltene Verbindungen (spart den TLS-Handshake, ~100-300 ms),
+    mit gzip. Rueckgabe (status, body_bytes, headers). Netzfehler -> FetchError."""
+    u = urllib.parse.urlsplit(url)
+    host = u.hostname
+    path = (u.path or "/") + ("?" + u.query if u.query else "")
+    hdr = {"Accept-Encoding": "gzip", "User-Agent": "Mozilla/5.0"}
+    hdr.update(headers or {})
+    if data is not None:
+        hdr.setdefault("Content-Type", "application/octet-stream")
+    last = None
+    for attempt in range(3):
+        conn, fresh = _take(host, timeout)
+        try:
+            conn.timeout = timeout
+            if conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            conn.request(method or ("POST" if data is not None else "GET"), path, body=data, headers=hdr)
+            r = conn.getresponse()
+            raw = r.read()
+            if r.getheader("Content-Encoding", "") == "gzip":
+                raw = gzip.decompress(raw)
+            if r.will_close:
+                conn.close()
+            else:
+                _give(host, conn)
+            return r.status, raw, r.headers
+        except (http.client.HTTPException, OSError, EOFError) as e:
+            last = e
+            conn.close()
+            if fresh and attempt >= 1:          # auch frische Verbindung scheitert -> aufgeben
+                break
+    raise FetchError(f"{host}: {type(last).__name__}: {last}")
 
 
 class ApiError(Exception):
@@ -140,13 +266,12 @@ def api(path, **params):
     params["key"] = API_KEY
     url = "https://www.googleapis.com/youtube/v3/" + path + "?" + urllib.parse.urlencode(params)
     try:
-        with urllib.request.urlopen(url, timeout=10) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        body = e.read()[:300].decode("utf-8", "replace")
-        raise ApiError(f"API {path} HTTP {e.code}: {body}") from e
-    except (urllib.error.URLError, TimeoutError) as e:
+        st, raw, _ = fetch(url, timeout=10)
+    except FetchError as e:
         raise ApiError(f"API {path} nicht erreichbar: {e}") from e
+    if st >= 400:
+        raise ApiError(f"API {path} HTTP {st}: {raw[:300].decode('utf-8', 'replace')}")
+    return json.loads(raw)
 
 
 def query_int(q, name, default, lo, hi):
@@ -312,14 +437,38 @@ def popular(region, cat_id):
     return cached(("pop", region, cat_id), FEED_CACHE_S, load)
 
 
+VID_TTL = 3600
+
+
 def videos_by_ids(ids):
-    """Volle Video-Daten fuer bis zu 50 IDs je API-Abruf (1 Einheit je Abruf), Reihenfolge bleibt."""
-    out = {}
-    for i in range(0, len(ids), 50):
-        chunk = ids[i:i + 50]
-        d = api("videos", part="snippet,contentDetails,statistics", id=",".join(chunk), hl="de")
-        for v in d.get("items", []):
-            out[v["id"]] = v
+    """Volle Video-Daten, Reihenfolge bleibt. Bekannte Videos kommen aus dem Cache, der Rest
+    in Paketen zu 50 (1 Einheit je Paket), mehrere Pakete parallel."""
+    now = time.time()
+    out, missing = {}, []
+    with _cache_lock:
+        for i in ids:
+            hit = _cache.get(("vid", i))
+            if hit and hit[1] and now - hit[0] < VID_TTL:
+                out[i] = hit[1]
+            elif i not in missing:
+                missing.append(i)
+    chunks = [missing[i:i + 50] for i in range(0, len(missing), 50)]
+
+    def get(chunk):
+        return api("videos", part="snippet,contentDetails,statistics", id=",".join(chunk), hl="de")
+    if len(chunks) == 1:
+        results = [get(chunks[0])]
+    elif chunks:
+        with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as ex:
+            results = list(ex.map(get, chunks))
+    else:
+        results = []
+    t0 = time.time()
+    with _cache_lock:
+        for d in results:
+            for v in d.get("items", []):
+                out[v["id"]] = v
+                _cache[("vid", v["id"])] = (t0, v)
     return [out[i] for i in ids if i in out]
 
 
@@ -362,11 +511,8 @@ def search(q, order, duration, hd, need):
 
 
 def video_by_id(vid):
-    def load():
-        d = api("videos", part="snippet,contentDetails,statistics", id=vid, hl="de")
-        items = d.get("items", [])
-        return items[0] if items else None
-    return cached(("vid", vid), 3600, load)
+    r = videos_by_ids([vid])
+    return r[0] if r else None
 
 
 class StreamError(Exception):
@@ -594,16 +740,46 @@ def r_video(h, path, query, body):
 THUMB_RE = re.compile(r"^/vi/([A-Za-z0-9_-]{11})/([a-z0-9]+)\.jpg$")
 
 
+_img_cache = OrderedDict()    # url -> (t, ctype, bytes)  Vorschaubilder im Speicher
+_img_lock = threading.Lock()
+_img_bytes = [0]
+IMG_CACHE_MAX = 64 * 1024 * 1024
+IMG_TTL = 6 * 3600
+
+
+def img_get(url):
+    """Bild holen (mit Speicher-Cache). Rueckgabe (status, ctype, bytes)."""
+    now = time.time()
+    with _img_lock:
+        hit = _img_cache.get(url)
+        if hit and now - hit[0] < IMG_TTL:
+            _img_cache.move_to_end(url)
+            return 200, hit[1], hit[2]
+    try:
+        st, raw, hd = fetch(url, timeout=10)
+    except FetchError:
+        return 504, "text/plain", b""
+    if st != 200:
+        return st, "text/plain", b""
+    ctype = hd.get("Content-Type", "image/jpeg")
+    with _img_lock:
+        old = _img_cache.pop(url, None)
+        if old:
+            _img_bytes[0] -= len(old[2])
+        _img_cache[url] = (now, ctype, raw)
+        _img_bytes[0] += len(raw)
+        while _img_bytes[0] > IMG_CACHE_MAX and _img_cache:
+            _, (_, _, b) = _img_cache.popitem(last=False)
+            _img_bytes[0] -= len(b)
+    return 200, ctype, raw
+
+
 def r_thumb(h, path, query, body):
     vid, name = THUMB_RE.match(path).groups()
     for n in (name, "hqdefault") if name == "sddefault" else (name,):
-        req = urllib.request.Request(f"https://i.ytimg.com/vi/{vid}/{n}.jpg",
-                                     headers={"User-Agent": "Mozilla/5.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return 200, "image/jpeg", r.read(), {"Cache-Control": "public, max-age=86400"}
-        except urllib.error.HTTPError:
-            continue
+        st, ctype, raw = img_get(f"https://i.ytimg.com/vi/{vid}/{n}.jpg")
+        if st == 200:
+            return 200, "image/jpeg", raw, {"Cache-Control": "public, max-age=86400"}
     return 404, "text/plain", b"", {}
 
 
@@ -710,13 +886,10 @@ def r_img(h, path, query, body):
     host = urllib.parse.urlsplit(u).hostname or ""
     if not u.startswith("https://") or not host.endswith(IMG_HOSTS):
         return 400, "text/plain", b"", {}
-    try:
-        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            ctype = r.headers.get("Content-Type", "image/jpeg")
-            return 200, ctype, r.read(), {"Cache-Control": "public, max-age=86400"}
-    except urllib.error.HTTPError as e:
-        return e.code, "text/plain", b"", {}
+    st, ctype, raw = img_get(u)
+    if st != 200:
+        return st, "text/plain", b"", {}
+    return 200, ctype, raw, {"Cache-Control": "public, max-age=86400"}
 
 
 SEARCH_RE = re.compile(r"^/feeds/api/videos$")
@@ -740,15 +913,20 @@ def r_search(h, path, query, body):
 def r_suggest(h, path, query, body):
     """Suchvorschlaege 1:1 von Google durchreichen (Format bleibt so, wie die App es kennt)."""
     qs = urllib.parse.urlencode({k: v[0] for k, v in query.items()})
-    req = urllib.request.Request("https://suggestqueries.google.com/complete/search?" + qs,
-                                 headers={"User-Agent": "Mozilla/5.0"})
+    key = ("sug", qs)
+
+    def load():
+        st, raw, hd = fetch("https://suggestqueries.google.com/complete/search?" + qs, timeout=8)
+        return st, hd.get("Content-Type", "application/json; charset=UTF-8"), raw
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return 200, r.headers.get("Content-Type", "application/json; charset=UTF-8"), r.read(), {}
-    except urllib.error.HTTPError as e:
-        return e.code, "text/plain", b"", {}
-    except (urllib.error.URLError, TimeoutError):
+        st, ctype, raw = cached(key, 3600, load)
+    except FetchError:
         return 503, "text/plain", b"", {}
+    if st != 200:
+        with _cache_lock:
+            _cache.pop(key, None)
+        return st, "text/plain", b"", {}
+    return 200, ctype, raw, {}
 
 
 # ================================================================ Oeffentliche Funktionen (0.8)
@@ -760,14 +938,14 @@ def innertube_next_ids(vid):
     robust gegen Layout-Aenderungen. Gesperrt wird hier (anders als 'player') kaum."""
     body = {"context": {"client": {"clientName": "WEB", "clientVersion": WEB_VER,
                                    "hl": "de", "gl": "DE"}}, "videoId": vid}
-    req = urllib.request.Request(
-        "https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0",
-                 "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": WEB_VER,
-                 "Origin": "https://www.youtube.com"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        txt = r.read().decode("utf-8", "replace")
+    st, raw, _ = fetch("https://www.youtube.com/youtubei/v1/next?prettyPrint=false",
+                       data=json.dumps(body).encode(), timeout=10,
+                       headers={"Content-Type": "application/json",
+                                "X-Youtube-Client-Name": "1", "X-Youtube-Client-Version": WEB_VER,
+                                "Origin": "https://www.youtube.com"})
+    if st != 200:
+        raise FetchError(f"next HTTP {st}")
+    txt = raw.decode("utf-8", "replace")
     ids = []
     for m in re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})"', txt):
         i = m.group(1)
@@ -928,8 +1106,8 @@ def playlist_items(plid, token_fn=None):
             out.append(v)
         return out
     key = ("pli", plid, bool(token_fn))
-    if token_fn:                 # private Daten nicht lange cachen
-        return cached(key + (id(token_fn),), 30, load)
+    if token_fn:                 # private Daten nur kurz cachen (forget() leert sie bei Aenderungen)
+        return cached(key, 30, load)
     return cached(key, 600, load)
 
 
@@ -1135,16 +1313,15 @@ def new_token(account_id, kind, ttl):
 
 
 def google_post(url, fields):
-    req = urllib.request.Request(url, data=urllib.parse.urlencode(fields).encode(),
-                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        try:
-            return json.loads(e.read().decode("utf-8", "replace"))
-        except ValueError:
-            return {"error": f"http_{e.code}"}
+        st, raw, _ = fetch(url, data=urllib.parse.urlencode(fields).encode(),
+                           headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+    except FetchError as e:
+        return {"error": f"netz: {e}"}
+    try:
+        return json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        return {"error": f"http_{st}"}
 
 
 def google_token(acc_id):
@@ -1177,16 +1354,15 @@ def api_user(token_fn, path, _method="GET", _body=None, **params):
     hdr = {"Authorization": "Bearer " + token_fn()}
     if data is not None:
         hdr["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=hdr, method=_method)
+    elif _method in ("POST", "PUT"):
+        data = b""
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        msg = e.read()[:300].decode("utf-8", "replace")
-        raise ApiError(f"API(user) {_method} {path} HTTP {e.code}: {msg}") from e
-    except (urllib.error.URLError, TimeoutError) as e:
+        st, raw, _ = fetch(url, data=data, headers=hdr, method=_method, timeout=15)
+    except FetchError as e:
         raise ApiError(f"API(user) {path} nicht erreichbar: {e}") from e
+    if st >= 400:
+        raise ApiError(f"API(user) {_method} {path} HTTP {st}: {raw[:300].decode('utf-8', 'replace')}")
+    return json.loads(raw) if raw else {}
 
 
 def auth_account(h):
@@ -1407,19 +1583,23 @@ def new_sub_videos(acc):
     """Neueste Uploads der Abos (max. 50 Kanaele x 5 Videos), 15 min gecacht."""
     def load():
         subs = my_subscriptions(acc)[:50]
-        rows = []
-        for s in subs:
-            chid = ((s.get("snippet") or {}).get("resourceId") or {}).get("channelId", "")
-            if not chid.startswith("UC"):
-                continue
-            try:
+        chids = [((s.get("snippet") or {}).get("resourceId") or {}).get("channelId", "") for s in subs]
+        chids = [c for c in chids if c.startswith("UC")]
+
+        def latest(chid):          # je Kanal 10 min gecacht, parallel abgefragt
+            def load1():
                 d = api("playlistItems", part="contentDetails", playlistId="UU" + chid[2:], maxResults=5)
+                return [((it.get("contentDetails") or {}).get("videoPublishedAt") or "",
+                         (it.get("contentDetails") or {}).get("videoId"))
+                        for it in d.get("items", []) if (it.get("contentDetails") or {}).get("videoId")]
+            try:
+                return cached(("uu5", chid), 600, load1)
             except ApiError:
-                continue
-            for it in d.get("items", []):
-                cd = it.get("contentDetails") or {}
-                if cd.get("videoId"):
-                    rows.append((cd.get("videoPublishedAt") or "", cd["videoId"]))
+                return []
+        rows = []
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for part in ex.map(latest, chids):
+                rows += part
         rows.sort(reverse=True)
         return videos_by_ids([v for _, v in rows[:100]])
     return cached(("nsv", acc), 900, load)
@@ -1566,11 +1746,14 @@ def my_watch_later(acc):
 
 
 def forget(acc, *keys):
+    now = time.time()
     with _cache_lock:
         for k in keys:
             _cache.pop((k, acc), None)
+            _forgot[(k, acc)] = now
         for k in [k for k in _cache if k and k[0] == "pli" and len(k) > 2 and k[2]]:
             _cache.pop(k, None)
+            _forgot[k] = now
 
 
 def feed_resp(fid, title, path, query, items, render=None, kind="video", extra=""):
@@ -1848,7 +2031,17 @@ def r_batch(h, path, query, body):
     default_op = (re.search(r"<feed[^>]*>.*?<batch:operation\s+type=['\"](\w+)['\"]", body, re.S) or [None, "insert"])[1]
     acc = auth_account(h)
     out = []
-    for ent in re.findall(r"<entry\b.*?</entry>|<entry\b[^>]*/>", body, re.S):
+    entries = re.findall(r"<entry\b.*?</entry>|<entry\b[^>]*/>", body, re.S)
+    if target == "videos":       # alle Videos mit einem API-Abruf vorladen statt einzeln
+        want = []
+        for ent in entries:
+            m_id = re.search(r"<id>(.*?)</id>", ent, re.S)
+            v_id = (m_id.group(1).strip() if m_id else "").rstrip("/").split("/")[-1].split("?")[0].split(":")[-1]
+            if VID_RE.match(v_id):
+                want.append(v_id)
+        if want:
+            videos_by_ids(want)
+    for ent in entries:
         op_m = re.search(r"<batch:operation\s+type=['\"](\w+)['\"]", ent)
         op = op_m.group(1) if op_m else default_op
         bid_m = re.search(r"<batch:id>(.*?)</batch:id>", ent, re.S)
@@ -2065,7 +2258,10 @@ def main():
     if not API_KEY:
         print("WARNUNG: YT_API_KEY fehlt - Feeds liefern 503", flush=True)
     print(f"vita-youtube-adapter {VERSION} auf {LISTEN_HOST}:{LISTEN_PORT}, Basis {PUBLIC_BASE}", flush=True)
-    ThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+        request_queue_size = 64
+    Server((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":

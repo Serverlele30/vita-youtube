@@ -14,9 +14,9 @@
 /* DIAG-VERSION 3 */
 /* ohne Standardbibliothek: gcc erzeugt trotzdem memset/memcpy-Aufrufe -> selbst bereitstellen */
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-void *memset(void *d, int c, unsigned int n) { volatile unsigned char *p = d; while (n--) *p++ = (unsigned char)c; return d; }
+void *memset(void *d, int c, __SIZE_TYPE__ n) { volatile unsigned char *p = d; while (n--) *p++ = (unsigned char)c; return d; }
 __attribute__((optimize("no-tree-loop-distribute-patterns")))
-void *memcpy(void *d, const void *s, unsigned int n) {
+void *memcpy(void *d, const void *s, __SIZE_TYPE__ n) {
     volatile unsigned char *p = d; const unsigned char *q = s; while (n--) *p++ = *q++; return d; }
 
 #define LOGP "ux0:data/vytp_diag.txt"

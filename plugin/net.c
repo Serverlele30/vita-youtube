@@ -15,6 +15,7 @@
  */
 #include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/io/stat.h>
@@ -22,7 +23,7 @@
 #include <psp2/net/net.h>
 #include <psp2/net/http.h>
 
-#define VYTP_VERSION "2.3"
+#define VYTP_VERSION "3.1"
 #ifndef VERBOSE
 #define VERBOSE 0   /* 1 = jede Anfrage loggen/melden (nur zur Fehlersuche) */
 #endif
@@ -40,9 +41,21 @@
                     "streamingData(formats(itag,url,contentLength))"
 #define PLAYER_URL_FULL "https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false"
 
-#define MAX_CLIENTS 3
-#define UP_CHUNK    (2 * 1024 * 1024)   /* googlevideo in 2-MB-Stuecken holen */
-#define IO_BUF      (32 * 1024)
+/* Speicher sparsam: das Plugin lebt im Speicher der App (3.0 war zu gierig -> Absturz) */
+#define MAX_CLIENTS 5                   /* HEAD-keep-alive + Stream + Spulen gleichzeitig */
+#define UP_CHUNK    (2 * 1024 * 1024)   /* googlevideo in 2-MB-Stuecken holen (wie 2.3) */
+#define IO_BUF      (16 * 1024)
+#define N_CACHE     2                   /* zuletzt aufgeloeste Videos */
+#define CACHE_TTL_S (3 * 3600)          /* googlevideo-URLs gelten ~6 h */
+#define TRIES       3                   /* Versuche bei TLS-/Netzfehlern (z. B. 0x80431075) */
+#define IDLE_RCV_US (30 * 1000 * 1000)  /* App-Verbindung ohne Anfrage nach 30 s schliessen */
+
+/* -nostdlib: falls gcc memset/memcpy erzeugt */
+__attribute__((weak, optimize("no-tree-loop-distribute-patterns")))
+void *memset(void *d, int c, __SIZE_TYPE__ n) { volatile unsigned char *p = d; while (n--) *p++ = (unsigned char)c; return d; }
+__attribute__((weak, optimize("no-tree-loop-distribute-patterns")))
+void *memcpy(void *d, const void *s, __SIZE_TYPE__ n) {
+    volatile unsigned char *p = d; const unsigned char *q = s; while (n--) *p++ = *q++; return d; }
 
 static volatile int g_run = 1;
 static SceUID g_lock = -1;         /* schuetzt Cache + Besucher-ID */
@@ -208,6 +221,7 @@ static int json_str(const char *p, char *out, int cap) {
 }
 
 /* ------------------------------------------------------------ SceHttp */
+static unsigned int now_s(void) { return (unsigned int)(sceKernelGetProcessTimeWide() / 1000000ull); }
 static int g_tmpl = -1;
 
 static int http_template(void) {
@@ -215,44 +229,81 @@ static int http_template(void) {
     int r = sceHttpInit(1 * 1024 * 1024);   /* App hat meist schon init -> Fehler egal */
     if (r < 0) log_line("http-init: schon initialisiert oder Fehler (ok)");
     g_tmpl = sceHttpCreateTemplate(ANDROID_UA, SCE_HTTP_VERSION_1_1, SCE_TRUE);
-    if (g_tmpl < 0) event("http-template-fehler 0x%s%08X", "", g_tmpl);
+    if (g_tmpl < 0) { event("http-template-fehler 0x%s%08X", "", g_tmpl); return g_tmpl; }
+    /* feste Zeitlimits statt endlos haengen (App zeigt sonst irgendwann einen Fehler) */
+    sceHttpSetResolveTimeOut(g_tmpl, 5 * 1000 * 1000);
+    sceHttpSetResolveRetry(g_tmpl, 2);
+    sceHttpSetConnectTimeOut(g_tmpl, 8 * 1000 * 1000);
+    sceHttpSetSendTimeOut(g_tmpl, 10 * 1000 * 1000);
+    sceHttpSetRecvTimeOut(g_tmpl, 15 * 1000 * 1000);
     return g_tmpl;
 }
 
-/* Ein HTTP-Request; liefert reqId (>=0) + connId, Status in *status */
-static int http_open(int method, const char *url, const char **hdrs,
-                     const void *body, int body_len, int *conn_out, int *status) {
+/* KEIN globaler Verbindungs-Pool (offene TLS-Verbindungen belegen den HTTP-Speicher der App).
+ * Nur innerhalb EINES Streams wird die googlevideo-Verbindung fuer die Folge-Stuecke behalten. */
+static SceUID g_slot_lock = -1;
+
+typedef struct { int req, conn; } hreq_t;
+
+/* Ein HTTP-Request mit Wiederholung bei TLS-/Netzfehlern; Status in *status. 0 = ok.
+ * reuse=1: vorhandene h->conn weiterverwenden (keep-alive), sonst neue Verbindung. */
+static int http_open(hreq_t *h, int reuse, int method, const char *url, const char **hdrs,
+                     const void *body, int body_len, int *status) {
     int tmpl = http_template();
     if (tmpl < 0) return tmpl;
-    int conn = sceHttpCreateConnectionWithURL(tmpl, url, SCE_TRUE);
-    if (conn < 0) return conn;
-    int req = sceHttpCreateRequestWithURL(conn, method, url, (SceULong64)(body ? body_len : 0));
-    if (req < 0) { sceHttpDeleteConnection(conn); return req; }
-    for (int i = 0; hdrs && hdrs[i]; i += 2)
-        sceHttpAddRequestHeader(req, hdrs[i], hdrs[i + 1], SCE_HTTP_HEADER_OVERWRITE);
-    int r = sceHttpSendRequest(req, body, body ? body_len : 0);
-    if (r < 0) {
-        sceHttpDeleteRequest(req);
-        sceHttpDeleteConnection(conn);
-        return r;
+    int r = -1;
+    h->req = -1;
+    if (!reuse && h->conn >= 0) { sceHttpDeleteConnection(h->conn); h->conn = -1; }
+    for (int t = 0; t < TRIES; t++) {
+        if (t) sceKernelDelayThread((t == 1 ? 300 : 1200) * 1000);
+        int reused = h->conn >= 0;
+        if (!reused) {
+            h->conn = sceHttpCreateConnectionWithURL(tmpl, url, SCE_TRUE);
+            if (h->conn < 0) { r = h->conn; h->conn = -1; continue; }
+        }
+        h->req = sceHttpCreateRequestWithURL(h->conn, method, url, (SceULong64)(body ? body_len : 0));
+        if (h->req < 0) {
+            r = h->req; h->req = -1;
+            sceHttpDeleteConnection(h->conn); h->conn = -1;
+            if (reused) t--;
+            continue;
+        }
+        for (int i = 0; hdrs && hdrs[i]; i += 2)
+            sceHttpAddRequestHeader(h->req, hdrs[i], hdrs[i + 1], SCE_HTTP_HEADER_OVERWRITE);
+        r = sceHttpSendRequest(h->req, body, body ? body_len : 0);
+        if (r < 0) {
+            sceHttpDeleteRequest(h->req); h->req = -1;
+            sceHttpDeleteConnection(h->conn); h->conn = -1;   /* kaputte/geschlossene Verbindung */
+            if (reused) t--;                 /* alte keep-alive-Verbindung zaehlt nicht als Versuch */
+            continue;
+        }
+        sceHttpGetStatusCode(h->req, status);
+        return 0;
     }
-    sceHttpGetStatusCode(req, status);
-    *conn_out = conn;
-    return req;
+    return r;
 }
 
-static void http_close(int req, int conn) {
-    if (req >= 0) sceHttpDeleteRequest(req);
-    if (conn >= 0) sceHttpDeleteConnection(conn);
+/* keep_conn=1: Verbindung fuer den naechsten Request offen lassen (nur wenn Antwort komplett) */
+static void http_close(hreq_t *h, int keep_conn) {
+    if (h->req >= 0) sceHttpDeleteRequest(h->req);
+    h->req = -1;
+    if (!keep_conn && h->conn >= 0) { sceHttpDeleteConnection(h->conn); h->conn = -1; }
 }
 
-/* ------------------------------------------------------------ Player-API */
+/* ------------------------------------------------------------ Player-API + Cache */
+typedef struct {
+    char vid[12];
+    char url[4096];
+    unsigned long long len;
+    char hdrs[1024];        /* gespiegelte googlevideo-Kopfzeilen */
+    unsigned int t;         /* Zeitpunkt der Aufloesung (Sekunden) */
+    unsigned int used;
+} vcache_t;
+static vcache_t g_vc[N_CACHE];
 static char g_visitor[400];          /* X-Goog-Visitor-Id */
-static char g_cache_vid[12];
-static char g_cache_url[4096];
-static unsigned long long g_cache_len;
 static char g_resp[96 * 1024];       /* Player-Antwort (gekuerzt per fields=) */
 static char g_errmsg[64];
+
 
 static int read_body(int req, char *buf, int cap) {
     int got = 0;
@@ -265,8 +316,19 @@ static int read_body(int req, char *buf, int cap) {
     return got;
 }
 
-/* Einmal Player fragen. 1 = OK (URL im Cache), 0 = gesperrt (retry sinnvoll), <0 = Fehler */
-static int player_once(const char *vid, int use_fields) {
+/* Rest einer Antwort verwerfen, damit die Verbindung wiederverwendbar bleibt */
+static int drain(int req) {
+    char tmp[256];
+    for (int i = 0; i < 64; i++) {
+        int n = sceHttpReadData(req, tmp, sizeof tmp);
+        if (n == 0) return 1;
+        if (n < 0) return 0;
+    }
+    return 0;
+}
+
+/* Einmal Player fragen. 1 = OK (URL in e), 0 = gesperrt (retry sinnvoll), <0 = Fehler */
+static int player_once(const char *vid, int use_fields, vcache_t *e) {
     char body[512];
     int bl = sceClibSnprintf(body, sizeof body,
         "{\"context\":{\"client\":{\"clientName\":\"ANDROID\",\"clientVersion\":\"" ANDROID_VER "\","
@@ -282,24 +344,25 @@ static int player_once(const char *vid, int use_fields) {
     if (g_visitor[0]) { hdrs[h++] = "X-Goog-Visitor-Id"; hdrs[h++] = g_visitor; }
     hdrs[h] = 0;
 
-    int conn = -1, status = 0;
-    int req = http_open(SCE_HTTP_METHOD_POST, use_fields ? PLAYER_URL : PLAYER_URL_FULL,
-                        hdrs, body, bl, &conn, &status);
-    if (req < 0) { event("player-https-fehler 0x%s%08X", "", req); return req; }
-    int got = read_body(req, g_resp, sizeof g_resp);
-    http_close(req, conn);
+    hreq_t hr = {-1, -1};
+    int status = 0;
+    int r = http_open(&hr, 0, SCE_HTTP_METHOD_POST, use_fields ? PLAYER_URL : PLAYER_URL_FULL,
+                      hdrs, body, bl, &status);
+    if (r < 0) { event("player-https-fehler 0x%s%08X", "", r); return r; }
+    int got = read_body(hr.req, g_resp, sizeof g_resp);
+    http_close(&hr, 0);
     if (status != 200) {
         event("player-http %s%d", "", status);
-        return status == 400 ? -400 : -1;
+        return status == 400 ? -400 : (status >= 500 ? 0 : -1);
     }
 
-    /* Besucher-ID merken */
     const char *vd = sceClibStrstr(g_resp, "\"visitorData\":\"");
     if (vd) json_str(vd + 15, g_visitor, sizeof g_visitor);
 
     const char *ps = sceClibStrstr(g_resp, "\"playabilityStatus\":{");
     const char *st = ps ? sceClibStrstr(ps, "\"status\":\"") : 0;
-    char status_s[32] = "?";
+    char status_s[32];
+    status_s[0] = '?'; status_s[1] = 0;
     if (st) json_str(st + 10, status_s, sizeof status_s);
     if (sceClibStrncmp(status_s, "OK", 3) != 0) {
         sceClibSnprintf(g_errmsg, sizeof g_errmsg, "%s", status_s);
@@ -314,7 +377,6 @@ static int player_once(const char *vid, int use_fields) {
         it += 9;
     }
     if (!it) { event("kein-itag18 %s%d", "", got); return -3; }
-    /* Grenzen dieses Format-Objekts: vom '{' davor bis zum naechsten "itag" */
     const char *ob = it;
     while (ob > g_resp && *ob != '{') ob--;
     const char *oe = sceClibStrstr(it + 9, "\"itag\":");
@@ -324,172 +386,176 @@ static int player_once(const char *vid, int use_fields) {
     const char *cl = sceClibStrstr(ob, "\"contentLength\":\"");
     if (cl && cl >= oe) cl = 0;
     if (!u) { event("itag18-ohne-url %s%d", "", got); return -3; }
-    if (json_str(u + 7, g_cache_url, sizeof g_cache_url) < 0) {
+    if (json_str(u + 7, e->url, sizeof e->url) < 0) {
         event("url-zu-lang %s%d", "", got);
         return -3;
     }
-    g_cache_len = cl ? parse_u64(cl + 17) : 0;
-    sceClibStrncpy(g_cache_vid, vid, sizeof g_cache_vid);
+    e->len = cl ? parse_u64(cl + 17) : 0;
+    e->hdrs[0] = 0;
     return 1;
 }
 
-/* Video aufloesen (mit Cache + Wiederholung bei kurzer Sperre). 0 = OK */
-static int resolve(const char *vid, int force) {
-    if (!force && sceClibStrncmp(g_cache_vid, vid, 12) == 0 && g_cache_url[0]) return 0;
-    g_cache_vid[0] = 0;
-    g_cache_url[0] = 0;
-    int use_fields = 1;
-    static const int delays_ms[] = {0, 1500, 4000};
-    for (int a = 0; a < 3; a++) {
-        if (delays_ms[a]) sceKernelDelayThread(delays_ms[a] * 1000);
-        int r = player_once(vid, use_fields);
-        if (r == -400 && use_fields) { use_fields = 0; a--; continue; }  /* fields nicht akzeptiert */
-        if (r == 1) {
-            info("aufgeloest %s %d", vid, (int)(g_cache_len / 1024));
-            return 0;
-        }
-        if (r < 0) return r;   /* echter Fehler, nicht wiederholen */
-    }
-    return -10;
-}
-
 /* Gesamtgroesse per Range-Probe, falls contentLength fehlte */
-static int probe_len(void) {
+static int probe_len(vcache_t *e) {
     const char *hdrs[] = {"Range", "bytes=0-0", 0};
-    int conn = -1, status = 0;
-    int req = http_open(SCE_HTTP_METHOD_GET, g_cache_url, hdrs, 0, 0, &conn, &status);
-    if (req < 0) return req;
+    hreq_t hr = {-1, -1};
+    int status = 0;
+    if (http_open(&hr, 0, SCE_HTTP_METHOD_GET, e->url, hdrs, 0, 0, &status) < 0) return -1;
     char *all = 0;
     unsigned int alen = 0;
     int ok = -1;
-    if (status == 206 && sceHttpGetAllResponseHeaders(req, &all, &alen) >= 0) {
+    if (status == 206 && sceHttpGetAllResponseHeaders(hr.req, &all, &alen) >= 0) {
         const char *val = 0;
         unsigned int vlen = 0;
         if (sceHttpParseResponseHeader(all, alen, "Content-Range", &val, &vlen) >= 0 && val) {
             for (unsigned int i = 0; i < vlen; i++) if (val[i] == '/') {
-                g_cache_len = parse_u64(val + i + 1);
+                e->len = parse_u64(val + i + 1);
                 ok = 0;
                 break;
             }
         }
     }
-    char tmp[16];
-    sceHttpReadData(req, tmp, sizeof tmp);
-    http_close(req, conn);
+    drain(hr.req);
+    http_close(&hr, 0);
     if (ok < 0) event("probe-http %s%d", "", status);
     return ok;
 }
 
 /* Kopfzeilen der echten googlevideo-Antwort (per HEAD) fuer die App uebernehmen */
-static char g_up_vid[12];
-static char g_up_hdrs[1024];
-
-static void add_hdr(const char *all, unsigned int alen, const char *name) {
+static void add_hdr(char *dst, int cap, const char *all, unsigned int alen, const char *name) {
     const char *val = 0;
     unsigned int vlen = 0;
     if (sceHttpParseResponseHeader(all, alen, name, &val, &vlen) < 0 || !val) return;
-    int used = sceClibStrnlen(g_up_hdrs, sizeof g_up_hdrs);
+    int used = sceClibStrnlen(dst, cap);
     int nl = sceClibStrnlen(name, 64);
-    if (used + nl + (int)vlen + 5 >= (int)sizeof g_up_hdrs) return;
-    char *o = g_up_hdrs + used;            /* ohne %.*s, das kann sceClibSnprintf evtl. nicht */
+    if (used + nl + (int)vlen + 5 >= cap) return;
+    char *o = dst + used;
     for (int i = 0; i < nl; i++) *o++ = name[i];
     *o++ = ':'; *o++ = ' ';
     for (unsigned int i = 0; i < vlen; i++) *o++ = val[i];
     *o++ = '\r'; *o++ = '\n'; *o = 0;
 }
 
-static void upstream_headers(const char *vid) {
-    if (sceClibStrncmp(g_up_vid, vid, 12) == 0) return;
-    g_up_hdrs[0] = 0;
-    int conn = -1, status = 0;
-    int req = http_open(SCE_HTTP_METHOD_HEAD, g_cache_url, 0, 0, 0, &conn, &status);
-    if (req < 0) { event("gv-head-fehler 0x%s%08X", "", req); return; }
+static void upstream_headers(vcache_t *e) {
+    hreq_t hr = {-1, -1};
+    int status = 0;
+    int r = http_open(&hr, 0, SCE_HTTP_METHOD_HEAD, e->url, 0, 0, 0, &status);
+    if (r < 0) { event("gv-head-fehler 0x%s%08X", "", r); return; }
     char *all = 0;
     unsigned int alen = 0;
-    if (sceHttpGetAllResponseHeaders(req, &all, &alen) >= 0 && all) {
-        /* komplette Antwort ins Log, damit wir sie vergleichen koennen */
-        char tmp[1200];
-        int n = (int)alen < (int)sizeof tmp - 1 ? (int)alen : (int)sizeof tmp - 1;
-        sceClibMemcpy(tmp, all, n);
-        tmp[n] = 0;
-        vlog("--- googlevideo HEAD-Antwort ---");
-        vlog(tmp);
-        add_hdr(all, alen, "Last-Modified");
-        add_hdr(all, alen, "Cache-Control");
-        add_hdr(all, alen, "Expires");
-        add_hdr(all, alen, "Date");
-        add_hdr(all, alen, "Server");
-        add_hdr(all, alen, "X-Content-Type-Options");
+    e->hdrs[0] = 0;
+    if (sceHttpGetAllResponseHeaders(hr.req, &all, &alen) >= 0 && all) {
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "Last-Modified");
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "Cache-Control");
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "Expires");
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "Date");
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "Server");
+        add_hdr(e->hdrs, sizeof e->hdrs, all, alen, "X-Content-Type-Options");
+        if (!e->hdrs[0]) { e->hdrs[0] = ' '; e->hdrs[1] = 0; }   /* "versucht" markieren */
     }
-    http_close(req, conn);
+    http_close(&hr, 0);
     info("gv-head %s%d", "", status);
-    sceClibStrncpy(g_up_vid, vid, sizeof g_up_vid);
+}
+
+/* Video aufloesen (Cache mit N_CACHE Eintraegen). Aufruf NUR mit g_lock. Rueckgabe Eintrag/0 */
+static vcache_t *resolve(const char *vid, int force) {
+    vcache_t *e = 0, *lru = &g_vc[0];
+    for (int i = 0; i < N_CACHE; i++) {
+        if (sceClibStrncmp(g_vc[i].vid, vid, 12) == 0) e = &g_vc[i];
+        if (g_vc[i].used < lru->used) lru = &g_vc[i];
+    }
+    unsigned int t = now_s();
+    if (e && !force && e->url[0] && t - e->t < CACHE_TTL_S) { e->used = t + 1; return e; }
+    if (!e) e = lru;
+    e->vid[0] = 0;
+    e->url[0] = 0;
+    int use_fields = 1;
+    static const int delays_ms[] = {0, 1000, 3000};
+    for (int a = 0; a < 3; a++) {
+        if (delays_ms[a]) sceKernelDelayThread(delays_ms[a] * 1000);
+        int r = player_once(vid, use_fields, e);
+        if (r == -400 && use_fields) { use_fields = 0; a--; continue; }  /* fields nicht akzeptiert */
+        if (r == 1) {
+            if (e->len == 0 && probe_len(e) < 0) return 0;
+            sceClibStrncpy(e->vid, vid, sizeof e->vid);
+            e->t = t;
+            e->used = t + 1;
+            info("aufgeloest %s %d", vid, (int)(e->len / 1024));
+            return e;
+        }
+        if (r != 0) return 0;      /* 0 = kurz gesperrt / 5xx -> nochmal; sonst endgueltig */
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------ Client */
 static char g_iobuf[MAX_CLIENTS][IO_BUF];
+static char g_slot_url[MAX_CLIENTS][4096];   /* eigene URL-Kopie je Stream (Cache kann wechseln) */
 static volatile int g_slot_used[MAX_CLIENTS];
 
-static int stream_range(int c, char *buf, unsigned long long start, unsigned long long end,
-                        const char *vid) {
+/* start..end an die App senden. 0 = fertig, 1 = App hat abgebrochen, -1 = Fehler */
+static int stream_range(int c, char *buf, char *url, unsigned long long start,
+                        unsigned long long end, const char *vid) {
     unsigned long long pos = start;
-    int retried = 0;
+    int refreshed = 0, fails = 0, ret = 0;
+    hreq_t hr = {-1, -1};                     /* eine googlevideo-Verbindung fuer alle Stuecke */
     while (pos <= end) {
         unsigned long long b = pos + UP_CHUNK - 1;
         if (b > end) b = end;
         char range[64], s1[24], s2[24];
         sceClibSnprintf(range, sizeof range, "bytes=%s-%s", u64s(pos, s1), u64s(b, s2));
         const char *hdrs[] = {"Range", range, 0};
-        int conn = -1, status = 0;
-        int req = http_open(SCE_HTTP_METHOD_GET, g_cache_url, hdrs, 0, 0, &conn, &status);
-        if (req < 0) { event("gv-https-fehler 0x%s%08X", "", req); return -1; }
-        if (status == 403 && !retried) {          /* URL abgelaufen -> neu holen */
-            http_close(req, conn);
+        int status = 0;
+        int r = http_open(&hr, 1, SCE_HTTP_METHOD_GET, url, hdrs, 0, 0, &status);
+        if (r < 0) {
+            if (++fails <= 2) { sceKernelDelayThread(1000 * 1000); continue; }
+            event("gv-https-fehler 0x%s%08X", "", r);
+            ret = -1;
+            break;
+        }
+        if ((status == 403 || status == 410) && !refreshed) {   /* URL abgelaufen -> neu holen */
+            http_close(&hr, 0);
             sceKernelLockMutex(g_lock, 1, NULL);
-            int r = resolve(vid, 1);
+            vcache_t *e = resolve(vid, 1);
+            if (e) sceClibStrncpy(url, e->url, 4096);
             sceKernelUnlockMutex(g_lock, 1);
-            if (r < 0) return -1;
-            retried = 1;
+            if (!e) { ret = -1; break; }
+            refreshed = 1;
             continue;
         }
         if (status != 206 && status != 200) {
+            http_close(&hr, 0);
+            if (status >= 500 && ++fails <= 2) { sceKernelDelayThread(1000 * 1000); continue; }
             event("gv-http %s%d", "", status);
-            http_close(req, conn);
-            return -1;
+            ret = -1;
+            break;
         }
         if (pos == start) info("gv-ok %s%d", "", status);
-        int got_any = 0;
-        while (1) {
-            int n = sceHttpReadData(req, buf, IO_BUF);
+        int n = 0;
+        while (pos <= b) {
+            n = sceHttpReadData(hr.req, buf, IO_BUF);
             if (n <= 0) break;
-            got_any = 1;
-            if (send_all(c, buf, n) < 0) { http_close(req, conn); return 1; }  /* App hat abgebrochen */
-            unsigned long long before = pos - start;
+            if (send_all(c, buf, n) < 0) { ret = 1; break; }   /* App hat abgebrochen */
             pos += (unsigned)n;
-            if ((before >> 22) != ((pos - start) >> 22))   /* alle 4 MB */
-                info("gesendet-MB %s%d", "", (int)((pos - start) >> 20));
         }
-        http_close(req, conn);
-        if (!got_any) return -1;
+        if (ret == 1) { http_close(&hr, 0); break; }
+        int complete = (pos > b) && drain(hr.req);
+        http_close(&hr, complete);
+        if (pos <= b) {                       /* Stueck unvollstaendig -> ab pos weitermachen */
+            if (++fails <= 3) { info("gv-luecke %s%d", "", n); continue; }
+            ret = -1;
+            break;
+        }
+        fails = 0;
     }
-    return 0;
+    http_close(&hr, 0);
+    return ret;
 }
 
-static int handle_one(int c, char *buf, char *req, int got) {
-    /* komplette Anfrage der App loggen + kompakt melden */
+static int handle_one(int c, char *buf, char *url, char *req, int got) {
+    (void)got;
     vlog("--- Anfrage der App ---");
     vlog(req);
-#if VERBOSE
-    {
-        char m[180];
-        int j = 0;
-        const char *p = sceClibStrstr(req, "\r\n");
-        p = p ? p + 2 : req;
-        for (; *p && j < (int)sizeof m - 1; p++) m[j++] = (*p == '\r' || *p == '\n') ? '|' : *p;
-        m[j] = 0;
-        ping(m);
-    }
-#endif
 
     int is_head = sceClibStrncmp(req, "HEAD ", 5) == 0;
     int is_get = sceClibStrncmp(req, "GET ", 4) == 0;
@@ -517,22 +583,17 @@ static int handle_one(int c, char *buf, char *req, int got) {
         }
     }
 
-    {
-        char m[96], x1[24], x2[24];
-        sceClibSnprintf(m, sizeof m, "req %s %s r=%s-%s", is_head ? "HEAD" : "GET", vid,
-                        has_range ? (suffix ? "suf" : u64s(rs, x1)) : "keine",
-                        (has_range && re != (unsigned long long)-1) ? u64s(re, x2) : "");
-        vlog(m);
-        vping(m);
-    }
-
+    char up_hdrs[1024];
     sceKernelLockMutex(g_lock, 1, NULL);
-    int r = resolve(vid, 0);
-    if (r == 0 && g_cache_len == 0) r = probe_len();
-    unsigned long long total = g_cache_len;
-    if (r == 0) upstream_headers(vid);
+    vcache_t *e = resolve(vid, 0);
+    if (e && !e->hdrs[0]) upstream_headers(e);
+    unsigned long long total = e ? e->len : 0;
+    if (e) {
+        sceClibStrncpy(url, e->url, 4096);
+        sceClibStrncpy(up_hdrs, e->hdrs[0] == ' ' ? "" : e->hdrs, sizeof up_hdrs);
+    }
     sceKernelUnlockMutex(g_lock, 1);
-    if (r < 0 || total == 0) {
+    if (!e || total == 0) {
         send_simple(c, 503, g_errmsg[0] ? g_errmsg : "stream unavailable");
         return 0;
     }
@@ -561,23 +622,16 @@ static int handle_one(int c, char *buf, char *req, int got) {
         n = sceClibSnprintf(hdr, sizeof hdr,
             "HTTP/1.1 206 Partial Content\r\n%sContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\n"
             "Content-Range: bytes %s-%s/%s\r\nContent-Length: %s\r\nConnection: %s\r\n\r\n",
-            g_up_hdrs, u64s(start, a1), u64s(end, a2), u64s(total, a3), u64s(end - start + 1, a4), connh);
+            up_hdrs, u64s(start, a1), u64s(end, a2), u64s(total, a3), u64s(end - start + 1, a4), connh);
     else
         n = sceClibSnprintf(hdr, sizeof hdr,
             "HTTP/1.1 200 OK\r\n%sContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\n"
-            "Content-Length: %s\r\nConnection: %s\r\n\r\n", g_up_hdrs, u64s(total, a1), connh);
+            "Content-Length: %s\r\nConnection: %s\r\n\r\n", up_hdrs, u64s(total, a1), connh);
     if (n >= (int)sizeof hdr) n = sizeof hdr - 1;
-    if (send_all(c, hdr, n) < 0) { event("antwort-senden-fehler %s%d", "", 0); return 0; }
-    vlog("--- unsere Antwort ---");
-    vlog(hdr);
-    {
-        char m[96], x1[24], x2[24];
-        sceClibSnprintf(m, sizeof m, "antwort %d %s-%s", has_range ? 206 : 200, u64s(start, x1), u64s(end, x2));
-        vping(m);
-    }
+    if (send_all(c, hdr, n) < 0) return 0;
     if (is_head) return 1;   /* Verbindung offen lassen, App macht ggf. weiter */
 
-    int sr = stream_range(c, buf, start, end, vid);
+    int sr = stream_range(c, buf, url, start, end, vid);
     if (sr < 0) event("stream-abbruch %s %d", vid, (int)(start / 1024));
     else if (sr == 1) info("app-hat-abgebrochen %s %d", vid, 0);
     else info("stream-fertig %s %d", vid, 0);
@@ -585,10 +639,11 @@ static int handle_one(int c, char *buf, char *req, int got) {
 }
 
 /* Verbindung bedienen: mehrere Anfragen hintereinander (keep-alive nach HEAD) */
-static void handle_client(int c, char *buf) {
+static void handle_client(int c, int slot) {
     static char reqs[MAX_CLIENTS][1536];
-    char *req = reqs[0];
-    for (int i = 0; i < MAX_CLIENTS; i++) if (buf == g_iobuf[i]) req = reqs[i];
+    char *req = reqs[slot];
+    int tmo = IDLE_RCV_US;
+    sceNetSetsockopt(c, SCE_NET_SOL_SOCKET, SCE_NET_SO_RCVTIMEO, &tmo, sizeof tmo);
     for (int round = 0; round < 8; round++) {
         int got = 0;
         req[0] = 0;
@@ -599,21 +654,20 @@ static void handle_client(int c, char *buf) {
             req[got] = 0;
             if (sceClibStrstr(req, "\r\n\r\n")) break;
         }
-        if (got <= 0) {
-            if (round > 0) info("app-schliesst-verbindung %s%d", "", round);
-            return;
-        }
-        if (!handle_one(c, buf, req, got)) return;
+        if (got <= 0) return;
+        if (!handle_one(c, g_iobuf[slot], g_slot_url[slot], req, got)) return;
     }
 }
 
 static int client_thread(SceSize args, void *argp) {
     int c = (args >= sizeof(int)) ? *(int *)argp : -1;
     int slot = -1;
+    sceKernelLockMutex(g_slot_lock, 1, NULL);
     for (int i = 0; i < MAX_CLIENTS; i++)
         if (!g_slot_used[i]) { g_slot_used[i] = 1; slot = i; break; }
+    sceKernelUnlockMutex(g_slot_lock, 1);
     if (c >= 0) {
-        if (slot >= 0) handle_client(c, g_iobuf[slot]);
+        if (slot >= 0) handle_client(c, slot);
         else send_simple(c, 503, "busy");
         sceNetSocketClose(c);
     }
@@ -668,6 +722,7 @@ int module_start(SceSize args, void *argp) {
     sceIoMkdir(LOG_DIR, 0777);
     log_line("vytp_net " VYTP_VERSION " gestartet");
     g_lock = sceKernelCreateMutex("vytp_lock", 0, 0, NULL);
+    g_slot_lock = sceKernelCreateMutex("vytp_slot", 0, 0, NULL);
     SceUID t = sceKernelCreateThread("vytp_server", server_thread, 0x10000100, 0x4000, 0, 0, NULL);
     if (t >= 0) sceKernelStartThread(t, 0, NULL);
     else log_line("server-thread fehlgeschlagen");
